@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$/NeuS" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/gaussian_splatting" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/gaussian_splatting/SIBR_viewers" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/gaussian_splatting/submodules/diff-gaussian-rasterization" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/gaussian_splatting/submodules/diff-gaussian-rasterization/third_party/glm" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/gaussian_splatting/submodules/fused-ssim" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/gaussian_splatting/submodules/simple-knn" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/instant-nsr-pl" vcs="Git" />
+  </component>
+</project>

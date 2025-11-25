@@ -406,6 +406,21 @@ def main():
         print(f"  ... 以及其他 {len(apis) - 5} 个 API")
     print()
 
+    # # 测试函数
+    # cam = wrapper.gaussian._pick_view()
+    # H, W = 4, 4
+    # depth = torch.rand(H, W)  # 随机深度 > 0
+    # normal = torch.rand(H, W, 3) * 2 - 1  # [-1, 1] 的法线
+    # visibility_filter = torch.ones(H, W)  # 全部可见
+    #
+    # render_pkg = {
+    #     "depth": depth,
+    #     "normal": normal,
+    #     "visibility_filter": visibility_filter,
+    # }
+    # wrapper.gaussian._publish_render_outputs(cam, render_pkg)
+    # print(cam)
+
     # 训练主循环
     print("=" * 80)
     print("开始联合训练...")

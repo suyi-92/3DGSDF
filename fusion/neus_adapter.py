@@ -417,18 +417,21 @@ class NeuSAdapter(AdapterBase):
         )
 
         color_fine = render_out["color_fine"]
-        gradients = render_out["gradients"]
+        s_val = render_out["s_val"]
+        cdf_fine = render_out["cdf_fine"]
         weight_sum = render_out["weight_sum"]
+        weight_max = render_out["weight_max"]
+        gradients = render_out["gradients"]
+        weights = render_out["weights"]
+        mid_z_vals = render_out["mid_z_vals"]
+        gradient_error = render_out["gradient_error"]
+        inside_sphere = render_out["inside_sphere"]
 
         # Compute depth as weighted mid_z (for geometric supervision)
-        mu_z = (render_out["weights"] * render_out["mid_z_vals"]).sum(
-            dim=-1, keepdim=True
-        )
+        mu_z = (weights * mid_z_vals).sum(dim=-1, keepdim=True)
 
         # Compute normal as weighted gradients
-        weighted_grad = (
-            render_out["gradients"] * render_out["weights"][..., None]
-        ).sum(dim=1)
+        weighted_grad = (gradients * weights[..., None]).sum(dim=1)
         weighted_normal = torch.nn.functional.normalize(
             weighted_grad, dim=-1, eps=self.geom_loss_cfg.get("eps", 1e-6)
         )

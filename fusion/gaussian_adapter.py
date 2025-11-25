@@ -102,6 +102,7 @@ class GaussianSplattingAdapter(AdapterBase):
         if torch is None:
             raise RuntimeError("PyTorch is required for GaussianSplattingAdapter.")
         parser = argparse.ArgumentParser(add_help=False)
+        # 将配置项注入 argparse 以复用参数解析逻辑
         lp = self.ModelParams(parser)
         op = self.OptimizationParams(parser)
         pp = self.PipelineParams(parser)
@@ -117,7 +118,7 @@ class GaussianSplattingAdapter(AdapterBase):
             **self.config.get("model", {}),
         }
         for k, v in overrides.items():
-            setattr(args, k, v)
+            setattr(args, k, v)  # 写入参数到 argparse.Namespace
 
         dataset = lp.extract(args)
         optim = op.extract(args)
@@ -193,7 +194,7 @@ class GaussianSplattingAdapter(AdapterBase):
 
         重建并随机化训练相机列表。
         """
-        cameras = self.scene.getTrainCameras().copy()
+        cameras = self.scene.getTrainCameras().copy()  # 复制以避免修改原始列表
         self._view_stack = cameras
         self._view_indices = list(range(len(cameras)))
 

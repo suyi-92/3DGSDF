@@ -31,7 +31,9 @@ class DummyDataService:
 class RenderAdapter(AdapterBase):
     """Publishes render statistics through the bus and exposes a render API."""
 
-    def __init__(self, registry: APIRegistry, bus: ExchangeBus, data_service: DummyDataService):
+    def __init__(
+        self, registry: APIRegistry, bus: ExchangeBus, data_service: DummyDataService
+    ):
         super().__init__("render", registry, bus, data_service)
         self.register_api("render", self.render, "Render a frame and publish stats")
 
@@ -48,7 +50,9 @@ class RenderAdapter(AdapterBase):
 class StatsAdapter(AdapterBase):
     """Subscribes to render statistics and records them in the data service."""
 
-    def __init__(self, registry: APIRegistry, bus: ExchangeBus, data_service: DummyDataService):
+    def __init__(
+        self, registry: APIRegistry, bus: ExchangeBus, data_service: DummyDataService
+    ):
         super().__init__("stats", registry, bus, data_service)
         # 注册一个 API，可用于查询保存的统计信息
         self.register_api("get", self.get_all, "Return collected stats")
@@ -70,6 +74,15 @@ def main():
 
     render = RenderAdapter(registry, bus, data_service)
     stats = StatsAdapter(registry, bus, data_service)
+
+    # 打印可用 API
+    apis = registry.describe()
+    print(f"已注册 {len(apis)} 个 API:")
+    for name, desc in list(apis.items())[:5]:
+        print(f"  - {name}: {desc}")
+    if len(apis) > 5:
+        print(f"  ... 以及其他 {len(apis) - 5} 个 API")
+    print()
 
     # 通过注册表调用 render API，触发一次渲染与发布。
     # 调用时无需直接持有 RenderAdapter 实例，只需知道完整端点名。

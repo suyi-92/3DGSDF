@@ -332,6 +332,22 @@ class NeuSAdapter(AdapterBase):
         pixels_x: Optional[torch.Tensor],
         pixels_y: Optional[torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Fetch depth/normal supervision samples from cached Gaussian results.
+
+        The function matches the current camera index to possible cache keys
+        (index, filename stem, etc.) and, if a cache entry exists, extracts the
+        depth and normal values at the given pixel coordinates. When either the
+        cache or pixel indices are unavailable, it gracefully returns `None` for
+        both outputs to indicate missing supervision.
+
+        从缓存的 Gaussian 结果中获取深度和法线监督样本。
+
+        该函数会将当前的相机索引映射到可能的缓存键（索引、文件名 stem 等），
+        如果找到对应的缓存条目，就会根据给定的像素坐标提取深度和法线值。
+        当缓存缺失或像素索引不可用时，会优雅地返回 `None` 表示缺少监督。
+        """
+
         if pixels_x is None or pixels_y is None:
             return None, None
 
@@ -381,14 +397,14 @@ class NeuSAdapter(AdapterBase):
             raise RuntimeError("PyTorch is required for NeuSAdapter.")
         r = self.runner
 
-        # Update learning rate (exp_runner.py line 111)
+        # 更新学习率调度（保持与 exp_runner 训练循环一致）
         r.update_learning_rate()
 
-        # Get image permutation and current image index
+        # 获取当前要采样的图像索引（按照乱序列表轮询）
         image_perm = r.get_image_perm()
         idx = image_perm[r.iter_step % len(image_perm)]
 
-        # Sample rays with pixel coordinates
+        # 在该视角下随机采样光线，并记录对应的像素坐标用于后续深度/法线监督
         data, pixels_x, pixels_y = self._sample_rays_with_pixels(idx, r.batch_size)
         rays_o, rays_d, true_rgb, mask = (
             data[:, :3],
@@ -397,15 +413,15 @@ class NeuSAdapter(AdapterBase):
             data[:, 9:10],
         )
 
-        # Compute near/far from sphere (exp_runner.py line 126)
+        # 根据球边界计算该批光线的近远平面
         near, far = r.dataset.near_far_from_sphere(rays_o, rays_d)
 
-        # Apply depth-guided sampling if available
+        # 如果有 GS 深度缓存，利用深度引导动态收缩采样窗口
         near, far = self._override_near_far_with_depth(
             idx, rays_o, rays_d, pixels_x, pixels_y, near, far
         )
 
-        # Render (exp_runner.py lines 128-145)
+        # 运行 NeuS 渲染器，得到颜色、权重、梯度等前向结果
         background = torch.ones([1, 3], device=r.device) if r.use_white_bkgd else None
         render_out = r.renderer.render(
             rays_o,
@@ -427,19 +443,23 @@ class NeuSAdapter(AdapterBase):
         gradient_error = render_out["gradient_error"]
         inside_sphere = render_out["inside_sphere"]
 
-        # Compute depth as weighted mid_z (for geometric supervision)
+        # 检查 weights 形状以避免潜在错误
+        if weights.shape[-1] != mid_z_vals.shape[-1]:
+            weights = weights[..., : mid_z_vals.shape[-1]]
+
+        # 以权重加权的 mid_z 作为渲染深度，用于几何监督
         mu_z = (weights * mid_z_vals).sum(dim=-1, keepdim=True)
 
-        # Compute normal as weighted gradients
+        # 用采样权重加权梯度并归一化，得到表面法线估计
         weighted_grad = (gradients * weights[..., None]).sum(dim=1)
         weighted_normal = torch.nn.functional.normalize(
             weighted_grad, dim=-1, eps=self.geom_loss_cfg.get("eps", 1e-6)
         )
 
-        # Sample GS depth/normal for geometric supervision
+        # 从 GS 深度缓存中抽取对应像素的深度/法线，作为外部几何监督
         depth_gt, normal_gt = self._sample_gs_depth_normal(idx, pixels_x, pixels_y)
 
-        # Color loss (exp_runner.py lines 154-159)
+        # 颜色重建误差：可选择使用掩码权重
         if r.mask_weight > 0.0:
             mask = (mask > 0.5).float()
         else:
@@ -454,15 +474,15 @@ class NeuSAdapter(AdapterBase):
             / mask_sum
         )
 
-        # Eikonal loss (exp_runner.py line 167)
+        # Eikonal 约束：梯度范数逼近 1
         eikonal_loss = ((torch.norm(gradients, dim=-1) - 1.0) ** 2).mean()
 
-        # Mask loss (exp_runner.py line 169)
+        # 掩码损失：权重和与掩码的 BCE
         mask_loss = torch.nn.functional.binary_cross_entropy(
             weight_sum.clip(1e-3, 1.0 - 1e-3), mask
         )
 
-        # Geometric supervision losses (depth + normal consistency)
+        # 几何监督损失：深度一致性与法线一致性
         geom_loss = 0.0
         depth_loss_val = 0.0
         normal_loss_val = 0.0
@@ -494,7 +514,7 @@ class NeuSAdapter(AdapterBase):
                 geom_loss + self.geom_loss_cfg.get("normal_w", 0.1) * normal_loss_val
             )
 
-        # Total loss (exp_runner.py lines 171-175)
+        # 总损失：颜色 + Eikonal + 掩码 + 几何监督
         loss = (
             color_loss
             + r.igr_weight * eikonal_loss
@@ -502,13 +522,15 @@ class NeuSAdapter(AdapterBase):
             + geom_loss
         )
 
-        # Backward and optimizer step (exp_runner.py lines 177-179)
+        # 反向传播并更新参数
         r.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         r.optimizer.step()
 
+        # 递增迭代步数计数器
         r.iter_step += 1
 
+        # 打包当前训练状态并回调/广播给外部
         state = NeuSIterationState(
             iteration=r.iter_step,
             loss=float(loss.detach().cpu()),
@@ -545,7 +567,8 @@ class NeuSAdapter(AdapterBase):
         """
         Evaluate the NeuS SDF network without tracking gradients.
 
-        无梯度评估 NeuS 的 SDF 网络，供外部模块查询。"""
+        无梯度评估 NeuS 的 SDF 网络，供外部模块查询。
+        """
         if torch is None:
             raise RuntimeError("PyTorch is required for NeuSAdapter.")
         if self.runner is None:

@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
-from .common import APIRegistry, ExchangeBus, SceneSpec
+from .common import APIRegistry, ExchangeBus, SceneSpec, MutableHandle
 from .data_service import DataService
 from .gaussian_adapter import GaussianSplattingAdapter
 from .neus_adapter import NeuSAdapter
@@ -121,7 +121,9 @@ class FusionWrapper:
         """
         Cache gaussian-rendered depth/normal maps for cross-model guidance.
 
-        缓存 3DGS 渲染的深度/法线，供 NeuS 采样引导使用。"""
+        缓存 3DGS 渲染的深度/法线，供 NeuS 采样引导使用。
+        """
+
         if not isinstance(payload, dict):
             return
 
@@ -225,52 +227,56 @@ class FusionWrapper:
         遵循 train.py 第 164-174 行的模式。
         """
         if torch is None:
-            return
+            return  # 环境未安装 torch，无法执行
         if (
             getattr(self.neus, "runner", None) is None
             or getattr(self.gaussian, "gaussians", None) is None
             or getattr(self.gaussian, "scene", None) is None
         ):
-            return
+            return  # 任一模块未初始化完成时直接跳过
 
-        gaussians = self.gaussian.gaussians
-        opt = getattr(self.gaussian, "_opt", None)
-        iteration = getattr(self.gaussian, "_iteration", 0)
+        gaussians = self.gaussian.gaussians  # 取出高斯模型实例
+        opt = getattr(self.gaussian, "_opt", None)  # 训练配置
+        iteration = getattr(self.gaussian, "_iteration", 0)  # 当前迭代步数
 
         # CRITICAL: Only apply SDF-guided densify in proper window and with proper frequency
         # Standard 3DGS densifies every 100 steps from iteration 500 to 15000
         if opt is None:
-            return
+            return  # 若无优化器配置则不执行
 
         # Check densification window
         if iteration < 500 or iteration >= opt.densify_until_iter:
-            return
+            return  # 不在允许的迭代区间内
 
         # REDUCE FREQUENCY: Only apply every 100 steps (matching standard 3DGS)
         if iteration % 100 != 0:
-            return
+            return  # 控制频率，与标准 3DGS 保持一致
 
-        with torch.no_grad():
-            xyz = gaussians.get_xyz
+        with torch.no_grad():  # 推理阶段不记录梯度，避免额外开销
+            xyz = gaussians.get_xyz  # 读取高斯中心坐标
             if xyz is None or xyz.numel() == 0:
-                return
+                return  # 没有有效点则跳过
 
             # Evaluate SDF at gaussian centers
-            sdf = self.neus.evaluate_sdf(xyz)
+            sdf = self.neus.evaluate_sdf(xyz)  # 在高斯中心查询 NeuS SDF
             if not isinstance(sdf, torch.Tensor):
-                return
+                return  # 未返回张量则不继续
 
             # Compute μ(s) = exp(-s²/(2σ²)) to weight points near the surface
             sigma = self.sdf_guidance_cfg.get("sigma", 0.5)
-            mu = torch.exp(-((sdf**2) / (2 * max(sigma, 1e-6) ** 2)))
+            mu = torch.exp(
+                -((sdf**2) / (2 * max(sigma, 1e-6) ** 2))
+            )  # 计算靠近表面的权重
 
             # Ensure mu is 1D tensor [N]
             if mu.ndim > 1:
-                mu = mu.squeeze()
+                mu = mu.squeeze()  # 压缩维度确保形状正确
 
             # Get accumulated gradients (from train.py line 167: add_densification_stats)
-            grad_accum = getattr(gaussians, "xyz_gradient_accum", None)
-            denom = getattr(gaussians, "denom", None)
+            grad_accum = getattr(
+                gaussians, "xyz_gradient_accum", None
+            )  # 累积的坐标梯度
+            denom = getattr(gaussians, "denom", None)  # 归一化因子
 
             # CRITICAL: Must have valid gradient accumulation
             if grad_accum is None or denom is None or denom.sum() == 0:
@@ -278,7 +284,7 @@ class FusionWrapper:
                 return
 
             # Normalize accumulated gradients
-            grads = grad_accum / (denom + 1e-9)
+            grads = grad_accum / (denom + 1e-9)  # 得到平均梯度
 
             # Ensure gradient shape is [N, 3]
             if grads.ndim == 2 and grads.shape[-1] != 3:
@@ -295,31 +301,35 @@ class FusionWrapper:
             # REDUCED omega_g to prevent over-densification
             omega_g = self.sdf_guidance_cfg.get("omega_g", 0.3)  # Reduced from 1.0
             # Ensure mu broadcasting works correctly: [N] -> [N, 1] -> [N, 3]
-            mu_expanded = mu.unsqueeze(-1).expand_as(grads)
+            mu_expanded = mu.unsqueeze(-1).expand_as(grads)  # 扩展 mu 方便与梯度广播
             # ONLY enhance gradients near surface (mu > 0.5)
-            eps_g = grads + omega_g * mu_expanded * (mu > 0.5).float().unsqueeze(-1)
+            eps_g = grads + omega_g * mu_expanded * (mu > 0.5).float().unsqueeze(
+                -1
+            )  # 只在靠近表面时强化梯度
 
             # Densify: follow train.py lines 169-171
             tau_g = self.sdf_guidance_cfg.get(
                 "tau_g", 0.0002
-            )  # Aligned with densify_grad_threshold
+            )  # Aligned with densify_grad_threshold，densify 梯度阈值
             size_threshold = (
                 20 if opt and iteration > opt.opacity_reset_interval else None
-            )
+            )  # 根据迭代步决定屏幕尺寸阈值
 
             # Use the official densify_and_prune method from GaussianModel
             # This handles both densification (clone/split) and pruning in one call
             if hasattr(gaussians, "densify_and_prune"):
                 # Calculate gradient magnitudes for densification criterion
-                grad_magnitude = torch.norm(eps_g, dim=-1, keepdim=True)
+                grad_magnitude = torch.norm(
+                    eps_g, dim=-1, keepdim=True
+                )  # 梯度模长用于阈值判断
 
                 # INCREASED min opacity threshold for more aggressive pruning
                 min_opacity = self.sdf_guidance_cfg.get(
                     "tau_p", 0.01
-                )  # Increased from 0.005
+                )  # Increased from 0.005，提升剪枝力度
 
                 # Track counts before operation
-                num_before = gaussians.get_xyz.shape[0]
+                num_before = gaussians.get_xyz.shape[0]  # 记录操作前点数
 
                 # Get radii from max_radii2D (already tracked by GaussianModel)
                 radii = getattr(gaussians, "max_radii2D", None)
@@ -337,36 +347,40 @@ class FusionWrapper:
                 )
 
                 # Update statistics
-                num_after = gaussians.get_xyz.shape[0]
+                num_after = gaussians.get_xyz.shape[0]  # 操作后的点数
                 if num_after > num_before:
-                    self._stats["densify_count"] += num_after - num_before
+                    self._stats["densify_count"] += num_after - num_before  # 统计新增点
                 elif num_after < num_before:
-                    self._stats["prune_count"] += num_before - num_after
+                    self._stats["prune_count"] += num_before - num_after  # 统计剪枝点
 
             else:
                 # Fallback: separate densify and prune
                 if torch.any(torch.norm(eps_g, dim=-1) > tau_g) and hasattr(
                     gaussians, "densify_and_clone"
                 ):
-                    num_before = gaussians.get_xyz.shape[0]
+                    num_before = gaussians.get_xyz.shape[0]  # 记录操作前点数
                     gaussians.densify_and_clone(
                         eps_g, tau_g, self.gaussian.scene.cameras_extent
                     )
                     self._stats["densify_count"] += (
-                        gaussians.get_xyz.shape[0] - num_before
+                        gaussians.get_xyz.shape[0] - num_before  # 累加新增的高斯数
                     )
 
                 # Prune condition: ε_p = σ_a - ω_p * (1 - μ(s))
-                opacity = gaussians.get_opacity
+                opacity = gaussians.get_opacity  # 当前不透明度
                 if opacity.ndim == 1:
-                    opacity = opacity[:, None]
+                    opacity = opacity[:, None]  # 扩展维度与 mu 对齐
                 omega_p = self.sdf_guidance_cfg.get("omega_p", 0.5)
-                eps_p = opacity - omega_p * (1 - mu.unsqueeze(-1))
-                prune_mask = eps_p.squeeze() < self.sdf_guidance_cfg.get("tau_p", 0.005)
+                eps_p = opacity - omega_p * (1 - mu.unsqueeze(-1))  # 计算剪枝指标
+                prune_mask = eps_p.squeeze() < self.sdf_guidance_cfg.get(
+                    "tau_p", 0.005
+                )  # 低于阈值的点将被剪枝
 
                 if torch.any(prune_mask) and hasattr(gaussians, "prune_points"):
-                    self._stats["prune_count"] += prune_mask.sum().item()
-                    gaussians.prune_points(prune_mask)
+                    self._stats[
+                        "prune_count"
+                    ] += prune_mask.sum().item()  # 记录剪枝数量
+                    gaussians.prune_points(prune_mask)  # 执行剪枝操作
 
     def get_statistics(self) -> Dict[str, Any]:
         """

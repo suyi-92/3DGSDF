@@ -1,14 +1,14 @@
 """
 Minimal, self-contained example showing how to use AdapterBase and ExchangeBus.
-最小可运行示例，演示如何使用 AdapterBase 与 ExchangeBus。
+最小可运行示例，演示 AdapterBase 与 ExchangeBus 的内在逻辑与调用流程。
 
 运行方式：
     python -m fusion.adapter_bus_minimal_example
 
-要点：
-- 定义两个适配器，一个发布消息，一个订阅消息。
-- 通过 register_api 注册可调用 API，并用 APIRegistry.call 调用。
-- ExchangeBus 用于在适配器间传递中间结果，无需直接依赖。
+阅读提示：
+- 每一步都用注释和打印语句标出，便于跟踪执行顺序。
+- render 适配器发布“渲染统计”主题，stats 适配器订阅并写入 data_service。
+- 所有对外暴露的接口都通过 APIRegistry.call 访问，避免耦合到具体类。
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ class RenderAdapter(AdapterBase):
         # 假装渲染了一帧并产生统计信息
         stats = {"frame": frame_id, "loss": 0.123}
         # 发布统计信息，供其他适配器订阅处理
+        print("[RenderAdapter] 发布 render.stats: ", stats)
         self.bus.publish("render.stats", stats)
         return stats
 
@@ -54,6 +55,7 @@ class StatsAdapter(AdapterBase):
         self.bus.subscribe("render.stats", self._on_render_stats)
 
     def _on_render_stats(self, payload):
+        print(f"[StatsAdapter] 收到 render.stats: {payload}")
         self.data_service.save({"source": self.name, **payload})
 
     def get_all(self):
@@ -68,11 +70,15 @@ def main():
     render = RenderAdapter(registry, bus, data_service)
     stats = StatsAdapter(registry, bus, data_service)
 
-    # 通过注册表调用 render API，触发一次渲染与发布
+    # 通过注册表调用 render API，触发一次渲染与发布。
+    # 调用时无需直接持有 RenderAdapter 实例，只需知道完整端点名。
+    print("[Main] 调用 API: render.render(frame_id=1)")
     result = registry.call("render.render", frame_id=1)
     print("Render result:", result)
 
-    # 再通过注册表调用 stats API，查看订阅收到的内容
+    # 再通过注册表调用 stats API，查看订阅收到的内容。
+    # 由于 StatsAdapter 在初始化时已订阅 render.stats，数据已经写入。
+    print("[Main] 调用 API: stats.get()")
     collected = registry.call("stats.get")
     print("Collected stats:", collected)
 

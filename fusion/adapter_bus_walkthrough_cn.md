@@ -7,6 +7,13 @@
 - **ExchangeBus**：轻量级发布/订阅总线，`publish(topic, payload)` 将消息广播到订阅了该主题的回调；`subscribe(topic, callback)` 为主题添加订阅者。
 - **AdapterBase**：适配器基类。保存 `registry`、`bus` 和 `data_service` 引用，并封装 `register_api`，简化子类开发。
 
+### 名字怎么读？（`render.stats` / `render.render`）
+示例中有两个看似相似的点名：
+- **`render.stats`（消息主题）**：前半部分 `render` 只是给主题加上来源命名空间，表明“渲染相关的事件”。后半部分 `stats` 表示消息的具体含义是“统计数据”。因此读作“渲染模块发布的统计信息”。
+- **`render.render`（API 端点）**：同样由 `adapter.endpoint` 组成，前半部分 `render` 是适配器名，后半部分 `render` 是该适配器对外暴露的接口名（具体方法）。读作“调用 render 适配器的 render 接口”。
+
+两者都遵循 `命名空间.名称` 形式，但语义不同：前者是事件主题，后者是 API 端点。之所以用相同前缀，是为了减少冲突并直观标注“是谁发的/暴露的”，同时不必把类实例传来传去。
+
 ## 示例运行流程（按时间顺序）
 1. **初始化**
    ```python

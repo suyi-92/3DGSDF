@@ -39,6 +39,7 @@ class RenderAdapter(AdapterBase):
         # 假装渲染了一帧并产生统计信息
         stats = {"frame": frame_id, "loss": 0.123}
         # 发布统计信息，供其他适配器订阅处理
+        # 主题名采用 "命名空间.具体含义" 形式：render 表示来源（渲染相关），stats 表示内容是统计数据
         print("[RenderAdapter] 发布 render.stats: ", stats)
         self.bus.publish("render.stats", stats)
         return stats

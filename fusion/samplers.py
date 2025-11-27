@@ -21,20 +21,39 @@ except ImportError:  # pragma: no cover
 
 
 class RaySampler(nn.Module):
-    """Abstract sampler interface returning per-ray depth samples."""
+    """
+    Abstract sampler interface returning per-ray depth samples.
+
+    抽象采样器接口，负责为每条光线返回一组深度采样点。
+    """
 
     def get_z_vals(self, rays_o, rays_d, near, far, **kwargs):
+        """
+        Compute depth samples along rays between near/far.
+
+        计算介于近端和远端之间的光线深度采样点，需要子类实现具体逻辑。
+        """
         raise NotImplementedError
 
 
 class UniformSampler(RaySampler):
-    """Standard stratified sampler between global near/far planes."""
+    """
+    Standard stratified sampler between global near/far planes.
+
+    在全局的 near/far 范围内执行分层采样的标准实现。
+    """
 
     def __init__(self, training: bool = True):
         super().__init__()
         self.training = training
 
     def get_z_vals(self, rays_o, rays_d, near, far, n_samples: int, **_: Any):
+        """
+        Stratified sample depths for a batch of rays.
+
+        对一批光线在 near/far 范围内进行分层深度采样，返回形状为
+        [num_rays, n_samples] 的深度值张量。
+        """
         if torch is None:  # pragma: no cover - runtime guard
             raise RuntimeError("PyTorch is required for UniformSampler.")
 
@@ -45,7 +64,9 @@ class UniformSampler(RaySampler):
         near_t = _reshape_bounds(near, num_rays, device, dtype)
         far_t = _reshape_bounds(far, num_rays, device, dtype)
 
-        return _stratified_between(near_t, far_t, n_samples, dtype, device, self.training)
+        return _stratified_between(
+            near_t, far_t, n_samples, dtype, device, self.training
+        )
 
 
 class GSGuidedSampler(RaySampler):
@@ -57,6 +78,12 @@ class GSGuidedSampler(RaySampler):
     2) Query NeuS SDF once at the GS surface point.
     3) Sample within [D_gs - k * |sdf|, D_gs + k * |sdf|] with jitter.
     4) Fallback to uniform sampling when GS opacity is too low.
+
+    实现 GSDF 第 3.2.1 节的深度引导采样策略：
+    1）对光线执行 Gaussian Splatting 渲染以获取深度和不透明度；
+    2）在 GS 表面点进行一次 NeuS SDF 查询；
+    3）围绕 D_gs ± k * |sdf| 范围加入抖动采样；
+    4）当 GS 不透明度过低时回退到均匀采样。
     """
 
     def __init__(
@@ -90,6 +117,12 @@ class GSGuidedSampler(RaySampler):
         gs_outputs: Optional[Dict[str, Any]] = None,
         **gs_kwargs: Any,
     ):
+        """
+        Depth-guided sampling using GS depth + one SDF query.
+
+        依据 GS 渲染得到的深度和不透明度进行引导采样；若 GS 结果不可靠或缺失，
+        会自动回退到均匀采样。返回形状为 [num_rays, n_samples] 的深度值。
+        """
         if torch is None:  # pragma: no cover - runtime guard
             raise RuntimeError("PyTorch is required for GSGuidedSampler.")
 
@@ -103,7 +136,9 @@ class GSGuidedSampler(RaySampler):
         # 1) Obtain GS render outputs (depth + opacity/alpha)
         if gs_outputs is None:
             if self.gs_renderer is None:
-                raise ValueError("gs_renderer is required when gs_outputs is not provided.")
+                raise ValueError(
+                    "gs_renderer is required when gs_outputs is not provided."
+                )
             gs_outputs = self.gs_renderer(rays_o=rays_o, rays_d=rays_d, **gs_kwargs)
 
         depth = gs_outputs.get("depth") if isinstance(gs_outputs, dict) else None
@@ -117,7 +152,9 @@ class GSGuidedSampler(RaySampler):
 
         if depth is None:
             # Missing GS depth entirely -> uniform fallback
-            return self.uniform_sampler.get_z_vals(rays_o, rays_d, near_t, far_t, n_samples)
+            return self.uniform_sampler.get_z_vals(
+                rays_o, rays_d, near_t, far_t, n_samples
+            )
 
         depth_t = _reshape_bounds(depth, num_rays, device, dtype)
         if self.detach_gs_depth:
@@ -174,7 +211,11 @@ class GSGuidedSampler(RaySampler):
 
 
 def _reshape_bounds(value: Any, num_rays: int, device, dtype):
-    """Convert bounds/inputs to shape [num_rays, 1] on the target device."""
+    """
+    Convert bounds/inputs to shape [num_rays, 1] on the target device.
+
+    将传入的边界或输入张量转换为形状 [num_rays, 1]，并放到指定设备与数据类型上。
+    """
     if isinstance(value, torch.Tensor):
         tensor = value.to(device=device, dtype=dtype)
     else:
@@ -195,7 +236,11 @@ def _reshape_bounds(value: Any, num_rays: int, device, dtype):
 def _stratified_between(
     near: torch.Tensor, far: torch.Tensor, n_samples: int, dtype, device, training: bool
 ):
-    """Stratified sampling between per-ray near/far bounds."""
+    """
+    Stratified sampling between per-ray near/far bounds.
+
+    在每条光线对应的 near/far 范围内进行分层采样；训练模式下对区间加入随机抖动。
+    """
     t_vals = torch.linspace(0.0, 1.0, steps=n_samples, device=device, dtype=dtype)
     t_vals = t_vals.view(1, -1)
     z_vals = near * (1.0 - t_vals) + far * t_vals

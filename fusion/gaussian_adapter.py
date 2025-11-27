@@ -321,9 +321,12 @@ class GaussianSplattingAdapter(AdapterBase):
 
         self._iteration += 1
         cam = None
+        meta_z_vals = None
         if ray_batch is not None:
             meta = ray_batch.meta or {}
             cam = meta.get("camera")
+            if meta.get("z_vals") is not None:
+                meta_z_vals = torch.as_tensor(meta["z_vals"]) if torch else None
             if cam is None and "image_idx" in meta:
                 try:
                     idx = int(meta["image_idx"])
@@ -357,6 +360,8 @@ class GaussianSplattingAdapter(AdapterBase):
             bg,
             use_trained_exp=self._dataset.train_test_exp,
         )
+        if meta_z_vals is not None:
+            render_pkg["guided_z_vals"] = meta_z_vals.to(self._background.device)
         self._publish_render_outputs(cam, render_pkg)
         image = render_pkg["render"]
         gt = cam.original_image.to(image.device)

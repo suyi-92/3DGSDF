@@ -375,13 +375,18 @@ class NeuSRenderer:
         perturb_overwrite=-1,
         background_rgb=None,
         cos_anneal_ratio=0.0,
+        z_vals=None,
     ):
         batch_size = len(rays_o)
+        if z_vals is None:
+            base_samples = self.n_samples
+            z_vals = torch.linspace(0.0, 1.0, base_samples)
+            z_vals = near + (far - near) * z_vals[None, :]
+        else:
+            base_samples = z_vals.shape[-1]
         sample_dist = (
-            2.0 / self.n_samples
+            2.0 / base_samples
         )  # Assuming the region of interest is a unit sphere
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples)
-        z_vals = near + (far - near) * z_vals[None, :]
 
         z_vals_outside = None
         if self.n_outside > 0:
@@ -389,14 +394,14 @@ class NeuSRenderer:
                 1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside
             )
 
-        n_samples = self.n_samples
+        n_samples = base_samples
         perturb = self.perturb
 
         if perturb_overwrite >= 0:
             perturb = perturb_overwrite
         if perturb > 0:
             t_rand = torch.rand([batch_size, 1]) - 0.5
-            z_vals = z_vals + t_rand * 2.0 / self.n_samples
+            z_vals = z_vals + t_rand * 2.0 / base_samples
 
             if self.n_outside > 0:
                 mids = 0.5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
@@ -407,7 +412,7 @@ class NeuSRenderer:
 
         if self.n_outside > 0:
             z_vals_outside = (
-                far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
+                far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / base_samples
             )
 
         background_alpha = None
@@ -418,7 +423,7 @@ class NeuSRenderer:
             with torch.no_grad():
                 pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
                 sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(
-                    batch_size, self.n_samples
+                    batch_size, n_samples
                 )
 
                 for i in range(self.up_sample_steps):
@@ -439,7 +444,7 @@ class NeuSRenderer:
                         last=(i + 1 == self.up_sample_steps),
                     )
 
-            n_samples = self.n_samples + self.n_importance
+            n_samples = z_vals.shape[-1]
 
         # Background model
         if self.n_outside > 0:

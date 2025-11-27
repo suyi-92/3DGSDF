@@ -18,6 +18,7 @@ from .common import APIRegistry, ExchangeBus, SceneSpec, MutableHandle
 from .data_service import DataService
 from .gaussian_adapter import GaussianSplattingAdapter
 from .neus_adapter import NeuSAdapter
+from .samplers import GSGuidedSampler, RaySampler, UniformSampler
 
 
 class FusionWrapper:
@@ -86,6 +87,8 @@ class FusionWrapper:
         self.neus.sdf_guidance_cfg = self.sdf_guidance_cfg
         self.neus.geom_loss_cfg = self.geom_loss_cfg
         self._joint_iter = 0
+        self._ray_sampler: Optional[RaySampler] = None
+        self._ray_sampling_cfg: Dict[str, Any] = self.fusion_cfg.get("ray_sampling", {})
 
         # Statistics tracking for monitoring and debugging
         self._stats = {
@@ -118,6 +121,7 @@ class FusionWrapper:
         self.spec.neus_conf_path = str(conf_override)
         self.spec.neus_case = scene_label
         self.neus.bootstrap(self.spec)
+        self._configure_ray_sampler()
 
     def _on_gaussian_render(self, payload: Dict[str, Any]):
         """
@@ -184,6 +188,169 @@ class FusionWrapper:
         if not hasattr(adapter, "mutable"):
             raise AttributeError(f"Adapter '{model}' does not expose mutability.")
         return adapter.mutable(component)
+
+    def _configure_ray_sampler(self):
+        """
+        Instantiate and register the configured ray sampler.
+
+        基于 fusion_cfg 初始化射线采样器（默认分层采样，可选 GS 引导采样）。
+        """
+
+        cfg = self._ray_sampling_cfg or {}
+        enabled = bool(cfg.get("enabled", cfg.get("enable_guided", False)))
+        mode = cfg.get("mode", "guided" if enabled else "uniform")
+        training = bool(cfg.get("training", True))
+
+        # Default to UniformSampler when torch is unavailable or guidance is disabled
+        self._ray_sampler = UniformSampler(training=training) if torch else None
+        if not enabled and mode != "guided":
+            return
+
+        if torch is None:
+            print("[Fusion] Torch not available; falling back to uniform ray sampling.")
+            return
+
+        sdf_network = getattr(getattr(self.neus, "runner", None), "sdf_network", None)
+        if sdf_network is None:
+            print("[Fusion] NeuS sdf_network missing; guided sampler disabled.")
+            return
+
+        def _gs_renderer(rays_o, rays_d, **kwargs):
+            meta = kwargs.get("meta", {}) or {}
+            return self._gs_outputs_from_camera(meta)
+
+        sampler_kwargs = {
+            "gs_renderer": _gs_renderer,
+            "sdf_network": sdf_network,
+            "k_scale": float(cfg.get("k_scale", 4.0)),
+            "min_spread": float(cfg.get("min_spread", 0.02)),
+            "opacity_threshold": float(cfg.get("opacity_threshold", 0.1)),
+            "detach_gs_depth": bool(cfg.get("detach_gs_depth", True)),
+        }
+
+        try:
+            self._ray_sampler = GSGuidedSampler(**sampler_kwargs)
+            print("[Fusion] Enabled GS-guided ray sampling.")
+        except Exception as exc:
+            print(f"[Fusion] Failed to create guided sampler; fallback to uniform: {exc}")
+            self._ray_sampler = UniformSampler(training=training)
+
+    def _gs_outputs_from_camera(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Render GS depth/opacity for specific pixels if a camera is supplied.
+
+        若提供相机与像素坐标，则调用 3DGS 渲染器生成对应的深度/不透明度采样。
+        """
+
+        if torch is None:
+            return {}
+        if not self.gaussian or not getattr(self.gaussian, "gaussians", None):
+            return {}
+
+        cam = meta.get("camera")
+        if cam is None and "image_idx" in meta:
+            try:
+                idx = int(meta["image_idx"])
+                cameras = self.gaussian.scene.getTrainCameras()
+                if 0 <= idx < len(cameras):
+                    cam = cameras[idx]
+            except Exception:
+                cam = None
+
+        if cam is None:
+            return {}
+
+        pixels_x = meta.get("pixels_x")
+        pixels_y = meta.get("pixels_y")
+        if pixels_x is None or pixels_y is None:
+            return {}
+
+        try:
+            render_pkg = self.gaussian._render(
+                cam,
+                self.gaussian.gaussians,
+                self.gaussian._pipe,
+                self.gaussian._background,
+                use_trained_exp=getattr(self.gaussian._dataset, "train_test_exp", False),
+            )
+            depth = render_pkg.get("depth")
+            opacity = (
+                render_pkg.get("alpha")
+                or render_pkg.get("alphas")
+                or render_pkg.get("opacity")
+            )
+
+            if depth is None:
+                return {}
+
+            px = torch.as_tensor(pixels_x, device=depth.device).long()
+            py = torch.as_tensor(pixels_y, device=depth.device).long()
+            depth_samples = depth[(py, px)]
+            opacity_samples = None
+            if opacity is not None:
+                opacity_samples = torch.as_tensor(opacity, device=depth.device)[(py, px)]
+
+            return {"depth": depth_samples, "opacity": opacity_samples}
+        except Exception as exc:
+            print(f"[Fusion] GS render for guided sampling failed: {exc}")
+            return {}
+
+    def _attach_z_vals(self, ray_batch: Optional[Any]) -> Optional[Any]:
+        """
+        Run the configured sampler to generate z_vals for a RayBatch (in-place).
+
+        使用配置好的采样器为 RayBatch 生成 z_vals，并附加到 meta 中。
+        """
+
+        if ray_batch is None or self._ray_sampler is None or torch is None:
+            return ray_batch
+
+        meta = ray_batch.meta = ray_batch.meta or {}
+        n_samples = meta.get("n_samples") or self._ray_sampling_cfg.get("n_samples")
+        if n_samples is None:
+            renderer = getattr(getattr(self.neus, "runner", None), "renderer", None)
+            n_samples = getattr(renderer, "n_samples", None)
+
+        near = meta.get("near")
+        far = meta.get("far")
+        if near is None or far is None:
+            runner = getattr(self.neus, "runner", None)
+            if runner is not None:
+                rays_o = torch.as_tensor(ray_batch.origins, device=runner.device)
+                rays_d = torch.as_tensor(ray_batch.directions, device=runner.device)
+                try:
+                    near, far = runner.dataset.near_far_from_sphere(rays_o, rays_d)
+                    meta["near"], meta["far"] = near, far
+                except Exception:
+                    return ray_batch
+            else:
+                return ray_batch
+
+        if n_samples is None:
+            return ray_batch
+
+        rays_o = torch.as_tensor(ray_batch.origins)
+        rays_d = torch.as_tensor(ray_batch.directions)
+        if rays_o.device != near.device:
+            rays_o = rays_o.to(near.device)
+            rays_d = rays_d.to(near.device)
+
+        gs_outputs = meta.get("gs_outputs") or self._gs_outputs_from_camera(meta)
+
+        try:
+            z_vals = self._ray_sampler.get_z_vals(
+                rays_o,
+                rays_d,
+                near,
+                far,
+                n_samples=n_samples,
+                gs_outputs=gs_outputs,
+                meta=meta,
+            )
+            meta["z_vals"] = z_vals
+        except Exception as exc:
+            print(f"[Fusion] Guided ray sampling failed; keeping original batch: {exc}")
+        return ray_batch
 
     def register_api(self, name: str, func: Callable[..., Any], description: str):
         """
@@ -472,6 +639,7 @@ class FusionWrapper:
                 neus_ray_batch = self.data_service.sample_rays(
                     neus_batch_size, consumer="neus", **neus_kwargs
                 )
+                neus_ray_batch = self._attach_z_vals(neus_ray_batch)
                 self._stats["last_neus_ray_batch"] = neus_batch_size
             except Exception as e:
                 print(f"[Fusion] NeuS ray sampling failed (fallback to adapter sampler): {e}")
@@ -485,6 +653,7 @@ class FusionWrapper:
                 gaussian_ray_batch = self.data_service.sample_rays(
                     gaussian_batch_size, consumer="gaussian", **gs_kwargs
                 )
+                gaussian_ray_batch = self._attach_z_vals(gaussian_ray_batch)
                 self._stats["last_gaussian_ray_batch"] = gaussian_batch_size
             except Exception as e:
                 print(

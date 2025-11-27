@@ -27,6 +27,7 @@ from .data_service import DataService
 from .gaussian_adapter import GaussianSplattingAdapter
 from .neus_adapter import NeuSAdapter
 from .fusion_wrapper import FusionWrapper
+from .samplers import RaySampler, UniformSampler, GSGuidedSampler
 
 __all__ = [
     # 数据类 / Data classes
@@ -41,6 +42,9 @@ __all__ = [
     "GaussianSplattingAdapter",
     "NeuSAdapter",
     "FusionWrapper",
+    "RaySampler",
+    "UniformSampler",
+    "GSGuidedSampler",
     # 工具类 / Utility classes
     "MutableHandle",
     "APIRegistry",

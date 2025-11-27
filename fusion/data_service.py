@@ -120,6 +120,15 @@ class DataService:
         """
         self._ray_sampler = sampler
 
+    def has_ray_sampler(self) -> bool:
+        """
+        Indicate whether a ray sampler has been registered.
+
+        判断是否已经注册了射线采样器。
+        """
+
+        return self._ray_sampler is not None
+
     def sample_rays(self, batch_size: int, **kwargs) -> RayBatch:
         """
         Sample rays (+ colors) using the registered sampler. Optional kwargs are

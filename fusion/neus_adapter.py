@@ -404,14 +404,54 @@ class NeuSAdapter(AdapterBase):
         image_perm = r.get_image_perm()
         idx = image_perm[r.iter_step % len(image_perm)]
 
-        # 在该视角下随机采样光线，并记录对应的像素坐标用于后续深度/法线监督
-        data, pixels_x, pixels_y = self._sample_rays_with_pixels(idx, r.batch_size)
-        rays_o, rays_d, true_rgb, mask = (
-            data[:, :3],
-            data[:, 3:6],
-            data[:, 6:9],
-            data[:, 9:10],
-        )
+        # 尝试使用共享的采样器（若已注册），否则回退到本地随机像素采样
+        pixels_x = pixels_y = None
+        mask = None
+        ray_batch = None
+        if getattr(self.data_service, "has_ray_sampler", None) and self.data_service.has_ray_sampler():
+            try:
+                ray_batch = self.data_service.sample_rays(
+                    r.batch_size, camera_index=idx, return_pixels=True
+                )
+            except Exception:
+                ray_batch = None
+
+        if ray_batch is not None:
+            rays_o = torch.as_tensor(ray_batch.origins, device=r.device)
+            rays_d = torch.as_tensor(ray_batch.directions, device=r.device)
+            true_rgb = torch.as_tensor(ray_batch.colors, device=r.device)
+            meta = getattr(ray_batch, "meta", {}) or {}
+            pixels_x = meta.get("pixels_x")
+            pixels_y = meta.get("pixels_y")
+            mask = meta.get("mask")
+            meta_idx = meta.get("camera_index", idx)
+            if torch.is_tensor(meta_idx):
+                idx = int(meta_idx.item())
+            else:
+                idx = meta_idx
+
+            if pixels_x is not None:
+                pixels_x = torch.as_tensor(pixels_x, device=r.device)
+            if pixels_y is not None:
+                pixels_y = torch.as_tensor(pixels_y, device=r.device)
+            if mask is not None:
+                mask = torch.as_tensor(mask, device=r.device)
+                if mask.ndim == 1:
+                    mask = mask[:, None]
+        else:
+            data, pixels_x, pixels_y = self._sample_rays_with_pixels(idx, r.batch_size)
+            rays_o, rays_d, true_rgb, mask = (
+                data[:, :3],
+                data[:, 3:6],
+                data[:, 6:9],
+                data[:, 9:10],
+            )
+
+        if mask is None:
+            mask = torch.ones((true_rgb.shape[0], 1), device=true_rgb.device)
+
+        if torch.is_tensor(idx):
+            idx = int(idx.item())
 
         # 根据球边界计算该批光线的近远平面
         near, far = r.dataset.near_far_from_sphere(rays_o, rays_d)

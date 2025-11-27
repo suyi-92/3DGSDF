@@ -22,6 +22,7 @@ from .common import (
     SceneSpec,
     NeuSIterationState,
     MutableHandle,
+    RayBatch,
 )
 from .data_service import DataService
 
@@ -385,7 +386,9 @@ class NeuSAdapter(AdapterBase):
         return depth_samples, normal_samples
 
     def train_step(
-        self, callback: Optional[Callable[[NeuSIterationState], None]] = None
+        self,
+        ray_batch: Optional[RayBatch] = None,
+        callback: Optional[Callable[[NeuSIterationState], None]] = None,
     ):
         """
         Execute one NeuS optimization step and optionally report metrics.
@@ -404,17 +407,46 @@ class NeuSAdapter(AdapterBase):
         image_perm = r.get_image_perm()
         idx = image_perm[r.iter_step % len(image_perm)]
 
-        # 在该视角下随机采样光线，并记录对应的像素坐标用于后续深度/法线监督
-        data, pixels_x, pixels_y = self._sample_rays_with_pixels(idx, r.batch_size)
-        rays_o, rays_d, true_rgb, mask = (
-            data[:, :3],
-            data[:, 3:6],
-            data[:, 6:9],
-            data[:, 9:10],
-        )
+        # 在该视角下采样光线：优先使用外部采样器提供的 batch
+        if ray_batch is not None:
+            if self.runner and torch.is_tensor(ray_batch.origins):
+                device = self.runner.device
+            else:
+                device = getattr(r, "device", None)
+            rays_o = torch.as_tensor(ray_batch.origins, device=device)
+            rays_d = torch.as_tensor(ray_batch.directions, device=device)
+            true_rgb = torch.as_tensor(ray_batch.colors, device=device)
+            meta = ray_batch.meta or {}
+            mask = torch.as_tensor(
+                meta.get("mask", torch.ones_like(true_rgb[..., :1])), device=device
+            )
+            idx = int(meta.get("image_idx", idx))
+            pixels_x = meta.get("pixels_x")
+            pixels_y = meta.get("pixels_y")
+            if isinstance(pixels_x, torch.Tensor):
+                pixels_x = pixels_x.to(device)
+            if isinstance(pixels_y, torch.Tensor):
+                pixels_y = pixels_y.to(device)
+            if r.iter_step <= 5 or r.iter_step % 100 == 0:
+                print(
+                    f"[NeuS] Using external ray batch of size {rays_o.shape[0]} at iter {r.iter_step}"
+                )
+        else:
+            data, pixels_x, pixels_y = self._sample_rays_with_pixels(idx, r.batch_size)
+            rays_o, rays_d, true_rgb, mask = (
+                data[:, :3],
+                data[:, 3:6],
+                data[:, 6:9],
+                data[:, 9:10],
+            )
 
         # 根据球边界计算该批光线的近远平面
-        near, far = r.dataset.near_far_from_sphere(rays_o, rays_d)
+        meta = ray_batch.meta if ray_batch is not None else None
+        if meta is not None and (meta.get("near") is not None and meta.get("far") is not None):
+            near = torch.as_tensor(meta["near"], device=r.device)
+            far = torch.as_tensor(meta["far"], device=r.device)
+        else:
+            near, far = r.dataset.near_far_from_sphere(rays_o, rays_d)
 
         # 如果有 GS 深度缓存，利用深度引导动态收缩采样窗口
         near, far = self._override_near_far_with_depth(

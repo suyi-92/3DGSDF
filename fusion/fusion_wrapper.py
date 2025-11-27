@@ -96,6 +96,8 @@ class FusionWrapper:
             "prune_count": 0,
             "geom_loss_depth": 0.0,
             "geom_loss_normal": 0.0,
+            "last_neus_ray_batch": 0,
+            "last_gaussian_ray_batch": 0,
         }
 
     def bootstrap(self):
@@ -421,6 +423,10 @@ class FusionWrapper:
             print(f"Num Gaussians: {stats.get('num_gaussians', 'N/A')}")
             print(f"Densify/Prune: +{stats['densify_count']} / -{stats['prune_count']}")
             print(f"NeuS Iter: {stats.get('neus_iteration', 'N/A')}")
+            print(
+                "Ray Batches (NeuS/GS): "
+                f"{stats.get('last_neus_ray_batch', 0)} / {stats.get('last_gaussian_ray_batch', 0)}"
+            )
             print("=" * 50)
 
     def joint_step(
@@ -437,8 +443,57 @@ class FusionWrapper:
         """
         self._joint_iter += 1
 
+        # Step 0: Fetch shared ray batches for NeuS / Gaussian from the data service
+        sampling_cfg = self.fusion_cfg.get("ray_sampling", {})
+        neus_sampling_cfg = (
+            sampling_cfg.get("neus", sampling_cfg)
+            if isinstance(sampling_cfg, dict)
+            else {}
+        )
+        gaussian_sampling_cfg = (
+            sampling_cfg.get("gaussian", sampling_cfg)
+            if isinstance(sampling_cfg, dict)
+            else {}
+        )
+
+        neus_batch_size = neus_sampling_cfg.get(
+            "batch_size", getattr(getattr(self.neus, "runner", None), "batch_size", None)
+        )
+        gaussian_batch_size = gaussian_sampling_cfg.get("batch_size", None)
+        if gaussian_batch_size is None:
+            gaussian_batch_size = neus_batch_size
+
+        neus_ray_batch = None
+        gaussian_ray_batch = None
+
+        if neus_batch_size:
+            try:
+                neus_kwargs = {k: v for k, v in neus_sampling_cfg.items() if k != "batch_size"}
+                neus_ray_batch = self.data_service.sample_rays(
+                    neus_batch_size, consumer="neus", **neus_kwargs
+                )
+                self._stats["last_neus_ray_batch"] = neus_batch_size
+            except Exception as e:
+                print(f"[Fusion] NeuS ray sampling failed (fallback to adapter sampler): {e}")
+                self._stats["last_neus_ray_batch"] = 0
+
+        if gaussian_batch_size:
+            try:
+                gs_kwargs = {
+                    k: v for k, v in gaussian_sampling_cfg.items() if k != "batch_size"
+                }
+                gaussian_ray_batch = self.data_service.sample_rays(
+                    gaussian_batch_size, consumer="gaussian", **gs_kwargs
+                )
+                self._stats["last_gaussian_ray_batch"] = gaussian_batch_size
+            except Exception as e:
+                print(
+                    f"[Fusion] Gaussian ray sampling failed (fallback to adapter sampler): {e}"
+                )
+                self._stats["last_gaussian_ray_batch"] = 0
+
         # Step 1: Train NeuS with depth-guided sampling + geometric supervision
-        neus_state = self.neus.train_step()
+        neus_state = self.neus.train_step(ray_batch=neus_ray_batch)
 
         # Step 2: Periodically export NeuS mesh and import to Gaussians
         if mesh_every > 0 and neus_state.iteration % mesh_every == 0:
@@ -448,7 +503,7 @@ class FusionWrapper:
                 print(f"Warning: mesh sync failed at iter {self._joint_iter}: {e}")
 
         # Step 3: Train Gaussian Splatting (publishes depth/normal via bus)
-        gaussian_state = self.gaussian.train_step()
+        gaussian_state = self.gaussian.train_step(ray_batch=gaussian_ray_batch)
 
         # Step 4: Apply SDF-guided densify/prune
         self._sdf_guided_gaussian_update()

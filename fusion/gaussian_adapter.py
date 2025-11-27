@@ -30,6 +30,7 @@ from .common import (
     SceneSpec,
     GaussianIterationState,
     MutableHandle,
+    RayBatch,
 )
 from .data_service import DataService
 
@@ -305,7 +306,9 @@ class GaussianSplattingAdapter(AdapterBase):
         self.bus.publish("gaussian.render_outputs", payload)
 
     def train_step(
-        self, callback: Optional[Callable[[GaussianIterationState], None]] = None
+        self,
+        ray_batch: Optional[RayBatch] = None,
+        callback: Optional[Callable[[GaussianIterationState], None]] = None,
     ):
         """
         Execute one optimization iteration and optionally invoke callback with metrics.
@@ -317,7 +320,26 @@ class GaussianSplattingAdapter(AdapterBase):
         assert self.scene and self.gaussians
 
         self._iteration += 1
-        cam = self._pick_view()
+        cam = None
+        if ray_batch is not None:
+            meta = ray_batch.meta or {}
+            cam = meta.get("camera")
+            if cam is None and "image_idx" in meta:
+                try:
+                    idx = int(meta["image_idx"])
+                    cameras = self.scene.getTrainCameras()
+                    if 0 <= idx < len(cameras):
+                        cam = cameras[idx]
+                except Exception:
+                    cam = None
+
+            if cam is not None and (self._iteration <= 5 or self._iteration % 100 == 0):
+                print(
+                    f"[GS] Using external ray batch camera (iteration {self._iteration})"
+                )
+
+        if cam is None:
+            cam = self._pick_view()
         self.gaussians.update_learning_rate(self._iteration)
         if self._iteration % 1000 == 0:
             self.gaussians.oneupSHdegree()

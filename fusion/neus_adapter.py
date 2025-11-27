@@ -455,11 +455,18 @@ class NeuSAdapter(AdapterBase):
 
         # 运行 NeuS 渲染器，得到颜色、权重、梯度等前向结果
         background = torch.ones([1, 3], device=r.device) if r.use_white_bkgd else None
+        z_vals_override = None
+        if meta is not None and meta.get("z_vals") is not None:
+            z_vals_override = torch.as_tensor(meta["z_vals"], device=r.device)
+            if z_vals_override.ndim == 1:
+                z_vals_override = z_vals_override[None, :].expand(rays_o.shape[0], -1)
+
         render_out = r.renderer.render(
             rays_o,
             rays_d,
             near,
             far,
+            z_vals=z_vals_override,
             cos_anneal_ratio=r.get_cos_anneal_ratio(),
             background_rgb=background,
         )

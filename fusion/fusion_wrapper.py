@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover
     torch = None
 
-from .common import APIRegistry, ExchangeBus, SceneSpec, MutableHandle
+from .common import APIRegistry, ExchangeBus, SceneSpec, MutableHandle, RayBatch
 from .data_service import DataService
 from .gaussian_adapter import GaussianSplattingAdapter
 from .neus_adapter import NeuSAdapter
@@ -122,6 +122,7 @@ class FusionWrapper:
         self.spec.neus_case = scene_label
         self.neus.bootstrap(self.spec)
         self._configure_ray_sampler()
+        self._register_default_ray_sampler()
 
     def _on_gaussian_render(self, payload: Dict[str, Any]):
         """
@@ -197,7 +198,7 @@ class FusionWrapper:
         """
 
         cfg = self._ray_sampling_cfg or {}
-        enabled = bool(cfg.get("enabled", cfg.get("enable_guided", False)))
+        enabled = bool(cfg.get("enabled", cfg.get("enable_guided", True)))
         mode = cfg.get("mode", "guided" if enabled else "uniform")
         training = bool(cfg.get("training", True))
 
@@ -219,10 +220,16 @@ class FusionWrapper:
             meta = kwargs.get("meta", {}) or {}
             return self._gs_outputs_from_camera(meta)
 
+        # 允许配置粗/细两级 k（示例：k_scales=[3.0, 1.0]），若未给出则回退单一 k_scale
+        k_cfg = cfg.get("k_scales")
+        if k_cfg is None:
+            k_cfg = cfg.get("k_scale", [3.0, 1.0])  # 默认为粗/细双窗口 k=3,1
+        sampler_k = k_cfg
+
         sampler_kwargs = {
             "gs_renderer": _gs_renderer,
             "sdf_network": sdf_network,
-            "k_scale": float(cfg.get("k_scale", 4.0)),
+            "k_scale": sampler_k,
             "min_spread": float(cfg.get("min_spread", 0.02)),
             "opacity_threshold": float(cfg.get("opacity_threshold", 0.1)),
             "detach_gs_depth": bool(cfg.get("detach_gs_depth", True)),
@@ -295,6 +302,53 @@ class FusionWrapper:
             print(f"[Fusion] GS render for guided sampling failed: {exc}")
             return {}
 
+    def _shared_ray_sampler(
+        self, data_service: DataService, batch_size: int, **kwargs
+    ) -> RayBatch:
+        """
+        默认射线采样器：直接复用 NeuS 数据集生成射线，供 NeuS/GS 共用。
+        避免未注册采样器时 DataService.sample_rays 报错，方便 t5.py 等脚本直接跑联合优化。
+        """
+        if torch is None or getattr(self.neus, "runner", None) is None:
+            raise RuntimeError("Ray sampler requires NeuS runner and torch.")
+
+        runner = self.neus.runner
+        ds = runner.dataset
+
+        # 对齐 NeuS 训练的取样顺序，可通过 kwargs 覆盖 image_idx
+        image_perm = runner.get_image_perm()
+        idx = int(kwargs.get("image_idx", image_perm[runner.iter_step % len(image_perm)]))
+
+        data, pixels_x, pixels_y = self.neus._sample_rays_with_pixels(idx, batch_size)
+        rays_o, rays_d = data[:, :3], data[:, 3:6]
+        colors = data[:, 6:9]
+        mask = data[:, 9:10]
+
+        meta: Dict[str, Any] = {
+            "image_idx": idx,
+            "pixels_x": pixels_x,
+            "pixels_y": pixels_y,
+            "mask": mask,
+        }
+        try:
+            near, far = ds.near_far_from_sphere(rays_o, rays_d)
+            meta["near"], meta["far"] = near, far
+        except Exception:
+            pass
+
+        return RayBatch(origins=rays_o, directions=rays_d, colors=colors, meta=meta)
+
+    def _register_default_ray_sampler(self):
+        """
+        如果 DataService 尚未注册射线采样器，自动挂载共享采样器。
+        """
+        if getattr(self.data_service, "_ray_sampler", None) is None:
+            try:
+                self.data_service.register_ray_sampler(self._shared_ray_sampler)
+                print("[Fusion] Registered default ray sampler (NeuS dataset).")
+            except Exception as exc:
+                print(f"[Fusion] Failed to register default ray sampler: {exc}")
+
     def _attach_z_vals(self, ray_batch: Optional[Any]) -> Optional[Any]:
         """
         Run the configured sampler to generate z_vals for a RayBatch (in-place).
@@ -306,7 +360,11 @@ class FusionWrapper:
             return ray_batch
 
         meta = ray_batch.meta = ray_batch.meta or {}
-        n_samples = meta.get("n_samples") or self._ray_sampling_cfg.get("n_samples")
+        n_samples = (
+            meta.get("n_samples")
+            or self._ray_sampling_cfg.get("n_samples")
+            or self._ray_sampling_cfg.get("samples_per_scale")
+        )
         if n_samples is None:
             renderer = getattr(getattr(self.neus, "runner", None), "renderer", None)
             n_samples = getattr(renderer, "n_samples", None)
@@ -610,7 +668,7 @@ class FusionWrapper:
         """
         self._joint_iter += 1
 
-        # Step 0: Fetch shared ray batches for NeuS / Gaussian from the data service
+        # Step 0: 从 DataService 获取 NeuS / Gaussian 共用的射线样本，保证两侧看到一致的数据分布
         sampling_cfg = self.fusion_cfg.get("ray_sampling", {})
         neus_sampling_cfg = (
             sampling_cfg.get("neus", sampling_cfg)
@@ -640,6 +698,7 @@ class FusionWrapper:
                     neus_batch_size, consumer="neus", **neus_kwargs
                 )
                 neus_ray_batch = self._attach_z_vals(neus_ray_batch)
+                # 这里会调用自定义射线采样器（如 GS-guided）附加 z_vals，方便 NeuS 使用窄窗采样
                 self._stats["last_neus_ray_batch"] = neus_batch_size
             except Exception as e:
                 print(f"[Fusion] NeuS ray sampling failed (fallback to adapter sampler): {e}")
@@ -654,6 +713,7 @@ class FusionWrapper:
                     gaussian_batch_size, consumer="gaussian", **gs_kwargs
                 )
                 gaussian_ray_batch = self._attach_z_vals(gaussian_ray_batch)
+                # GS 端也附加 z_vals，尽量与 NeuS 使用相同采样策略，减少域偏移
                 self._stats["last_gaussian_ray_batch"] = gaussian_batch_size
             except Exception as e:
                 print(
@@ -661,23 +721,23 @@ class FusionWrapper:
                 )
                 self._stats["last_gaussian_ray_batch"] = 0
 
-        # Step 1: Train NeuS with depth-guided sampling + geometric supervision
+        # Step 1: NeuS 先训练；利用深度缓存调整采样窗，并计算深度/法线几何一致性损失
         neus_state = self.neus.train_step(ray_batch=neus_ray_batch)
 
-        # Step 2: Periodically export NeuS mesh and import to Gaussians
+        # Step 2: 按频率将 NeuS mesh 导入 GS，保持两侧几何对齐
         if mesh_every > 0 and neus_state.iteration % mesh_every == 0:
             try:
                 self.neus_to_gaussian()
             except Exception as e:
                 print(f"Warning: mesh sync failed at iter {self._joint_iter}: {e}")
 
-        # Step 3: Train Gaussian Splatting (publishes depth/normal via bus)
+        # Step 3: GS 训练，同时通过总线发布 depth/normal 供下一轮 NeuS 读取
         gaussian_state = self.gaussian.train_step(ray_batch=gaussian_ray_batch)
 
-        # Step 4: Apply SDF-guided densify/prune
+        # Step 4: 使用 NeuS SDF 结果指导 GS 稠密化/剪枝
         self._sdf_guided_gaussian_update()
 
-        # Step 5: Print statistics
+        # Step 5: 可选打印融合统计，关注深度命中率、高斯数量、densify/prune 计数
         if log_every > 0:
             self.print_statistics(interval=log_every)
 

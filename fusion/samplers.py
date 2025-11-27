@@ -90,7 +90,7 @@ class GSGuidedSampler(RaySampler):
         self,
         gs_renderer: Any,
         sdf_network: Any,
-        k_scale: float = 4.0,
+        k_scale: float | list[float] = 4.0,
         min_spread: float = 0.02,
         opacity_threshold: float = 0.1,
         detach_gs_depth: bool = True,
@@ -101,7 +101,11 @@ class GSGuidedSampler(RaySampler):
         super().__init__()
         self.gs_renderer = gs_renderer
         self.sdf_network = sdf_network
-        self.k_scale = float(k_scale)
+        # 支持粗/细两级采样窗口：k_scales 可为 float 或 [k_coarse, k_fine]
+        if isinstance(k_scale, (list, tuple)):
+            self.k_scales = [float(k) for k in k_scale]
+        else:
+            self.k_scales = [float(k_scale)]
         self.min_spread = float(min_spread)
         self.opacity_threshold = float(opacity_threshold)
         self.detach_gs_depth = detach_gs_depth
@@ -174,20 +178,26 @@ class GSGuidedSampler(RaySampler):
             sdf_vals = self.sdf_network.sdf(surface_pts)
         sdf_abs = sdf_vals.abs()
 
-        # 3) Compute adaptive sampling interval
-        radius = torch.clamp(self.k_scale * sdf_abs, min=self.min_spread)
-        local_near = torch.maximum(depth_t - radius, near_t)
-        local_far = torch.minimum(depth_t + radius, far_t)
+        # 3) Compute adaptive sampling intervals for each k in k_scales
+        guided_chunks = []
+        for k in self.k_scales:
+            radius = torch.clamp(k * sdf_abs, min=self.min_spread)
+            local_near = torch.maximum(depth_t - radius, near_t)
+            local_far = torch.minimum(depth_t + radius, far_t)
 
-        # Ensure valid ordering; otherwise fallback to global bounds
-        invalid_interval = local_far <= local_near
-        if invalid_interval.any():
-            local_near = torch.where(invalid_interval, near_t, local_near)
-            local_far = torch.where(invalid_interval, far_t, local_far)
+            # Ensure valid ordering; otherwise fallback to global bounds
+            invalid_interval = local_far <= local_near
+            if invalid_interval.any():
+                local_near = torch.where(invalid_interval, near_t, local_near)
+                local_far = torch.where(invalid_interval, far_t, local_far)
 
-        guided_z = _stratified_between(
-            local_near, local_far, n_samples, dtype, device, self.training
-        )
+            guided_z_chunk = _stratified_between(
+                local_near, local_far, n_samples, dtype, device, self.training
+            )
+            guided_chunks.append(guided_z_chunk)
+
+        # 拼接粗/细两级 z_vals（如 k=[3,1]），形状 [num_rays, n_samples * len(k_scales)]
+        guided_z = torch.cat(guided_chunks, dim=-1) if len(guided_chunks) > 1 else guided_chunks[0]
 
         # 5) Fallback to uniform sampling when GS opacity is unreliable
         if opacity_t is not None:

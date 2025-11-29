@@ -377,23 +377,45 @@ class NeuSRenderer:
         cos_anneal_ratio=0.0,
         z_vals=None,
     ):
+        """
+        对一批射线执行 NeuS 体渲染。
+
+        参数：
+            rays_o: [B, 3] 射线起点
+            rays_d: [B, 3] 射线方向
+            near/far: [B, 1] 或标量，射线的近/远平面
+            perturb_overwrite: 覆盖默认扰动开关（<0 保持默认）
+            background_rgb: 背景颜色（可选，配合 n_outside>0 使用）
+            cos_anneal_ratio: 余弦退火系数，用于梯度正则
+            z_vals: 自定义深度采样点，若提供则跳过默认均匀采样
+
+        返回：
+            dict，包括 color_fine、weights、cdf_fine、s_val、mid_z_vals、
+            gradient_error、inside_sphere 等渲染结果。
+        """
         batch_size = len(rays_o)
+
+        # 1) 若未提供 z_vals，则在 [0,1] 分层采样并映射到 [near, far]
+        #    z_vals 形状 [B, n_samples]，表示每条射线的深度采样点。
         if z_vals is None:
             base_samples = self.n_samples
             z_vals = torch.linspace(0.0, 1.0, base_samples)
             z_vals = near + (far - near) * z_vals[None, :]
         else:
             base_samples = z_vals.shape[-1]
+        #    sample_dist 是假设单位球下的步长，用于背景与前景段长度计算。
         sample_dist = (
             2.0 / base_samples
         )  # Assuming the region of interest is a unit sphere
 
+        # 2) 可选背景射线采样（远外球体），只在 n_outside>0 时启用 NeRF 式背景渲染。
         z_vals_outside = None
         if self.n_outside > 0:
             z_vals_outside = torch.linspace(
                 1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside
             )
 
+        # 3) 决定是否加入抖动扰动（随机 stratified），避免条纹伪影。
         n_samples = base_samples
         perturb = self.perturb
 
@@ -404,12 +426,14 @@ class NeuSRenderer:
             z_vals = z_vals + t_rand * 2.0 / base_samples
 
             if self.n_outside > 0:
+                # 背景采样同样加抖动，保持与前景一致的随机性
                 mids = 0.5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
                 upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
                 lower = torch.cat([z_vals_outside[..., :1], mids], -1)
                 t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
                 z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
 
+        # 4) 若有背景模型，将背景 z 取倒序映射到远处（球外），并与前景分开。
         if self.n_outside > 0:
             z_vals_outside = (
                 far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / base_samples
@@ -418,15 +442,17 @@ class NeuSRenderer:
         background_alpha = None
         background_sampled_color = None
 
-        # Up sample
+        # 5) 使用 SDF 做层级重要性采样：逐步插入更多 z 以聚焦表面附近。
         if self.n_importance > 0:
             with torch.no_grad():
+                # 当前 z 网格下查询一次 SDF，作为初始几何场估计
                 pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
                 sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(
                     batch_size, n_samples
                 )
 
                 for i in range(self.up_sample_steps):
+                    # 每轮利用 SDF 导出的密度权重进行重要性重采样
                     new_z_vals = self.up_sample(
                         rays_o,
                         rays_d,
@@ -435,6 +461,7 @@ class NeuSRenderer:
                         self.n_importance // self.up_sample_steps,
                         64 * 2**i,
                     )
+                    # 将新样本并入并保持排序，返回新的 z 与对应 SDF
                     z_vals, sdf = self.cat_z_vals(
                         rays_o,
                         rays_d,
@@ -446,7 +473,7 @@ class NeuSRenderer:
 
             n_samples = z_vals.shape[-1]
 
-        # Background model
+        # 6) 背景渲染（如果启用）：前景/背景 z 合并排序后喂给 NeRF 背景分支
         if self.n_outside > 0:
             z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
             z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
@@ -457,7 +484,7 @@ class NeuSRenderer:
             background_sampled_color = ret_outside["sampled_color"]
             background_alpha = ret_outside["alpha"]
 
-        # Render core
+        # 7) 主体渲染：使用 NeuS SDF/颜色网络完成体渲染，可能混合背景
         ret_fine = self.render_core(
             rays_o,
             rays_d,
@@ -472,6 +499,17 @@ class NeuSRenderer:
             cos_anneal_ratio=cos_anneal_ratio,
         )
 
+        # ret_fine（render_core 的输出）主要字段：
+        #   color: 同 color_fine，已包含背景混合（若启用）。
+        #   sdf: [B*n_samples, 1] 中点的 SDF 值（未 reshape）。
+        #   dists: [B, n_samples] 相邻 z 差分，末端补 sample_dist 使长度对齐。
+        #   gradients: 同上，SDF 梯度。
+        #   s_val: [B*n_samples, 1] = 1 / inv_s 的展开版本（在 render 中做均值）。
+        #   mid_z_vals: 同返回的 mid_z_vals。
+        #   weights: 体积权重；启用背景时包含背景段。
+        #   cdf: [B, n_samples] 前景 CDF。
+        #   gradient_error / inside_sphere: 同上。
+
         color_fine = ret_fine["color"]
         weights = ret_fine["weights"]
         weights_sum = weights.sum(dim=-1, keepdim=True)
@@ -479,6 +517,30 @@ class NeuSRenderer:
         s_val = (
             ret_fine["s_val"].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
         )
+
+        # 返回字段详细说明：
+        #   color_fine     : [B, 3]
+        #       - 最终渲染颜色；若启用背景分支，已按权重与背景颜色混合。
+        #   s_val          : [B, 1]
+        #       - = 1 / inv_s，deviation 网络的全局锐度尺度；值大→表面更尖锐，值小→更平滑。
+        #   cdf_fine       : [B, n_samples]
+        #       - 前景采样点的累积分布函数（CDF），用于重要性采样或可视化诊断。
+        #   weight_sum     : [B, 1]
+        #       - 所有体积权重之和；启用背景时包含前景 + 背景。
+        #   weight_max     : [B, 1]
+        #       - 射线上最大的单点权重，监控“是否过尖锐/过度集中”。
+        #   gradients      : [B, n_samples, 3]
+        #       - SDF 梯度（法线方向），与前景采样点一一对应。
+        #   weights        : [B, n_samples] 或 [B, n_samples + n_outside]
+        #       - 体积渲染权重；启用背景时尾部为背景段。只要前景可取 weights[:, :n_samples]。
+        #   mid_z_vals     : [B, n_samples]
+        #       - 每个采样段的中点深度，长度与前景采样一致；末段用 sample_dist 近似补齐，便于与 weights 对齐做期望。
+        #   gradient_error : 标量
+        #       - Eikonal 正则项，鼓励 |∇SDF| ≈ 1。
+        #   inside_sphere  : [B, n_samples]
+        #       - 标记中点是否在单位球内；用于背景混合和正则遮罩。
+        #   z_vals         : [B, n_samples]
+        #       - 本次使用的前景采样深度（若启用背景，背景 z 仅用于背景分支，不在此返回）。
 
         return {
             "color_fine": color_fine,
@@ -491,6 +553,7 @@ class NeuSRenderer:
             "mid_z_vals": ret_fine["mid_z_vals"],
             "gradient_error": ret_fine["gradient_error"],
             "inside_sphere": ret_fine["inside_sphere"],
+            "z_vals": z_vals,  # 返回采样的深度值，便于调试
         }
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):

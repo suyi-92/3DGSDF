@@ -130,14 +130,16 @@ class GSGuidedSampler(RaySampler):
         if torch is None:  # pragma: no cover - runtime guard
             raise RuntimeError("PyTorch is required for GSGuidedSampler.")
 
+        # 基本元数据：设备/数据类型/射线数量
         device = rays_o.device
         dtype = rays_o.dtype
         num_rays = rays_o.shape[0]
 
+        # Step 0: 将 near/far 统一 reshape 成 [num_rays,1] 便于后续广播
         near_t = _reshape_bounds(near, num_rays, device, dtype)
         far_t = _reshape_bounds(far, num_rays, device, dtype)
 
-        # 1) Obtain GS render outputs (depth + opacity/alpha)
+        # Step 1: 获取 GS 渲染结果（深度 + 不透明度）；若调用方未传入则现场渲染
         if gs_outputs is None:
             if self.gs_renderer is None:
                 raise ValueError(
@@ -145,6 +147,7 @@ class GSGuidedSampler(RaySampler):
                 )
             gs_outputs = self.gs_renderer(rays_o=rays_o, rays_d=rays_d, **gs_kwargs)
 
+        # Step 1.1: 解析深度与不透明度字段（兼容 alpha/alphas/opactiy 多种命名）
         depth = gs_outputs.get("depth") if isinstance(gs_outputs, dict) else None
         opacity = None
         if isinstance(gs_outputs, dict):
@@ -154,12 +157,14 @@ class GSGuidedSampler(RaySampler):
                 or gs_outputs.get("alphas")
             )
 
+        # Step 1.2: 若缺少深度，直接退回全局 uniform 采样
         if depth is None:
             # Missing GS depth entirely -> uniform fallback
             return self.uniform_sampler.get_z_vals(
                 rays_o, rays_d, near_t, far_t, n_samples
             )
 
+        # Step 1.3: 将深度/不透明度整理到统一形状，并可选择 detach 避免反传
         depth_t = _reshape_bounds(depth, num_rays, device, dtype)
         if self.detach_gs_depth:
             depth_t = depth_t.detach()
@@ -172,34 +177,41 @@ class GSGuidedSampler(RaySampler):
             if opacity_t.shape[-1] > 1:
                 opacity_t = opacity_t[..., :1]
 
-        # 2) One-tap SDF query at GS surface points
+        # Step 2: 在 GS 表面点上做一次 SDF 查询（无梯度）
         surface_pts = rays_o + depth_t * rays_d
         with torch.no_grad():
             sdf_vals = self.sdf_network.sdf(surface_pts)
         sdf_abs = sdf_vals.abs()
 
-        # 3) Compute adaptive sampling intervals for each k in k_scales
+        # Step 3: 按照 k_scales 自适应生成局部采样区间 [D_gs - k|sdf|, D_gs + k|sdf|]
         guided_chunks = []
         for k in self.k_scales:
+            # 3.1 半径下限设为 min_spread，避免区间塌缩
             radius = torch.clamp(k * sdf_abs, min=self.min_spread)
+            # 3.2 限制到全局 near/far 边界以内
             local_near = torch.maximum(depth_t - radius, near_t)
             local_far = torch.minimum(depth_t + radius, far_t)
 
-            # Ensure valid ordering; otherwise fallback to global bounds
+            # 3.3 如果局部区间反转，则回退到全局 near/far
             invalid_interval = local_far <= local_near
             if invalid_interval.any():
                 local_near = torch.where(invalid_interval, near_t, local_near)
                 local_far = torch.where(invalid_interval, far_t, local_far)
 
+            # 3.4 在局部区间内做分层采样，并根据 self.training 决定是否抖动
             guided_z_chunk = _stratified_between(
                 local_near, local_far, n_samples, dtype, device, self.training
             )
             guided_chunks.append(guided_z_chunk)
 
-        # 拼接粗/细两级 z_vals（如 k=[3,1]），形状 [num_rays, n_samples * len(k_scales)]
-        guided_z = torch.cat(guided_chunks, dim=-1) if len(guided_chunks) > 1 else guided_chunks[0]
+        # Step 3.5: 拼接多尺度 z_vals（如 k=[3,1]）-> [num_rays, n_samples * len(k_scales)]
+        guided_z = (
+            torch.cat(guided_chunks, dim=-1)
+            if len(guided_chunks) > 1
+            else guided_chunks[0]
+        )
 
-        # 5) Fallback to uniform sampling when GS opacity is unreliable
+        # Step 4: 如果 GS 不透明度过低，则对对应射线改用 uniform 采样（置信度回退）
         if opacity_t is not None:
             low_conf_mask = opacity_t.squeeze(-1) < self.opacity_threshold
         else:

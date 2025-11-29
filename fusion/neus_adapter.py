@@ -159,29 +159,38 @@ class NeuSAdapter(AdapterBase):
         if torch is None or self.runner is None:
             raise RuntimeError("PyTorch is required for NeuSAdapter.")
         ds = self.runner.dataset
+
+        # TODO: 可以做更复杂的采样器，这里先用最简单的随机采样
         try:
+            # 以内参的 device 作为统一设备（一般是 cuda:0）
             device = ds.intrinsics_all_inv.device
+
+            # 1. 在统一 device 上采样像素坐标
             pixels_x = torch.randint(low=0, high=ds.W, size=[batch_size], device=device)
             pixels_y = torch.randint(low=0, high=ds.H, size=[batch_size], device=device)
 
-            img = ds.images[idx]
-            msk = ds.masks[idx]
-            px_img = pixels_x.to(img.device)
-            py_img = pixels_y.to(img.device)
-            color = img[(py_img, px_img)].to(device)
-            mask = msk[(py_img, px_img)].to(device)
+            # 2. 从 image / mask 中取颜色和 mask
+            color = ds.images[idx].to(device)[(pixels_y, pixels_x)]
+            mask = ds.masks[idx].to(device)[(pixels_y, pixels_x)]
 
+            # 3. 像素坐标 -> 归一化相机坐标
             p = torch.stack(
                 [pixels_x, pixels_y, torch.ones_like(pixels_y, device=device)], dim=-1
             ).float()
             p = torch.matmul(
                 ds.intrinsics_all_inv[idx, None, :3, :3].to(device), p[:, :, None]
             ).squeeze(-1)
+
+            # 4. 得到射线方向（世界坐标）
             rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
             rays_v = torch.matmul(
                 ds.pose_all[idx, None, :3, :3].to(device), rays_v[:, :, None]
             ).squeeze(-1)
+
+            # 5. 射线起点（世界坐标）
             rays_o = ds.pose_all[idx, None, :3, 3].to(device).expand_as(rays_v)
+
+            # 6. 最终拼接，全部在同一个 device 上，不再来回 .cpu() / .cuda()
             data = torch.cat([rays_o, rays_v, color, mask[:, :1]], dim=-1)
             return data, pixels_x, pixels_y
         except Exception:
@@ -442,7 +451,9 @@ class NeuSAdapter(AdapterBase):
 
         # 根据球边界计算该批光线的近远平面
         meta = ray_batch.meta if ray_batch is not None else None
-        if meta is not None and (meta.get("near") is not None and meta.get("far") is not None):
+        if meta is not None and (
+            meta.get("near") is not None and meta.get("far") is not None
+        ):
             near = torch.as_tensor(meta["near"], device=r.device)
             far = torch.as_tensor(meta["far"], device=r.device)
         else:

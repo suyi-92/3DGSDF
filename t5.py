@@ -356,6 +356,7 @@ def main():
     args = parse_args()
 
     # 设置随机种子
+    args.seed = 13
     if args.seed is not None:
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():

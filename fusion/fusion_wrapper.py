@@ -221,7 +221,7 @@ class FusionWrapper:
             return self._gs_outputs_from_camera(meta)
 
         # 允许配置粗/细两级 k（示例：k_scales=[3.0, 1.0]），若未给出则回退单一 k_scale
-        k_cfg = cfg.get("k_scales")
+        k_cfg = cfg.get("k_scales", None)
         if k_cfg is None:
             k_cfg = cfg.get("k_scale", [3.0, 1.0])  # 默认为粗/细双窗口 k=3,1
         sampler_k = k_cfg
@@ -239,7 +239,9 @@ class FusionWrapper:
             self._ray_sampler = GSGuidedSampler(**sampler_kwargs)
             print("[Fusion] Enabled GS-guided ray sampling.")
         except Exception as exc:
-            print(f"[Fusion] Failed to create guided sampler; fallback to uniform: {exc}")
+            print(
+                f"[Fusion] Failed to create guided sampler; fallback to uniform: {exc}"
+            )
             self._ray_sampler = UniformSampler(training=training)
 
     def _gs_outputs_from_camera(self, meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -278,8 +280,19 @@ class FusionWrapper:
                 self.gaussian.gaussians,
                 self.gaussian._pipe,
                 self.gaussian._background,
-                use_trained_exp=getattr(self.gaussian._dataset, "train_test_exp", False),
+                use_trained_exp=getattr(
+                    self.gaussian._dataset, "train_test_exp", False
+                ),
             )
+            # render_pkg 常见字段说明（便于后续读取含义）：
+            # - render: (3,H,W) 渲染出的 RGB，通常只在完整渲染时使用
+            # - depth: (1,H,W) 或 (H,W) 的深度/逆深度图，是指导采样时最核心的信号
+            # - alpha/alphas/opacity: (1,H,W) 或 (H,W) 的像素不透明度，用来衡量该像素由多少高斯贡献
+            # - normal/normals: (3,H,W) 法线图，可用于几何监督或调试
+            # - visibility_filter: bool 掩码，标记当前视角下哪些高斯被看到，配合 radii/viewspace_points 做 densify 统计
+            # - radii: (N) 每个高斯在屏幕上的投影半径，结合 visibility_filter 更新最大半径
+            # - viewspace_points: (N,3) 投影点位置，供 densification/裁剪统计使用
+
             depth = render_pkg.get("depth")
             opacity = (
                 render_pkg.get("alpha")
@@ -292,11 +305,14 @@ class FusionWrapper:
 
             px = torch.as_tensor(pixels_x, device=depth.device).long()
             py = torch.as_tensor(pixels_y, device=depth.device).long()
-            depth_samples = depth[(py, px)]
+            depth_samples = depth[0][(py, px)]
             opacity_samples = None
             if opacity is not None:
-                opacity_samples = torch.as_tensor(opacity, device=depth.device)[(py, px)]
+                opacity_samples = torch.as_tensor(opacity, device=depth.device)[
+                    (py, px)
+                ]
 
+            # TODO: 这里的"opacity"是None，后续上游使用时要注意判空
             return {"depth": depth_samples, "opacity": opacity_samples}
         except Exception as exc:
             print(f"[Fusion] GS render for guided sampling failed: {exc}")
@@ -317,7 +333,9 @@ class FusionWrapper:
 
         # 对齐 NeuS 训练的取样顺序，可通过 kwargs 覆盖 image_idx
         image_perm = runner.get_image_perm()
-        idx = int(kwargs.get("image_idx", image_perm[runner.iter_step % len(image_perm)]))
+        idx = int(
+            kwargs.get("image_idx", image_perm[runner.iter_step % len(image_perm)])
+        )
 
         data, pixels_x, pixels_y = self.neus._sample_rays_with_pixels(idx, batch_size)
         rays_o, rays_d = data[:, :3], data[:, 3:6]
@@ -682,7 +700,8 @@ class FusionWrapper:
         )
 
         neus_batch_size = neus_sampling_cfg.get(
-            "batch_size", getattr(getattr(self.neus, "runner", None), "batch_size", None)
+            "batch_size",
+            getattr(getattr(self.neus, "runner", None), "batch_size", None),
         )
         gaussian_batch_size = gaussian_sampling_cfg.get("batch_size", None)
         if gaussian_batch_size is None:
@@ -693,7 +712,9 @@ class FusionWrapper:
 
         if neus_batch_size:
             try:
-                neus_kwargs = {k: v for k, v in neus_sampling_cfg.items() if k != "batch_size"}
+                neus_kwargs = {
+                    k: v for k, v in neus_sampling_cfg.items() if k != "batch_size"
+                }
                 neus_ray_batch = self.data_service.sample_rays(
                     neus_batch_size, consumer="neus", **neus_kwargs
                 )
@@ -701,7 +722,9 @@ class FusionWrapper:
                 # 这里会调用自定义射线采样器（如 GS-guided）附加 z_vals，方便 NeuS 使用窄窗采样
                 self._stats["last_neus_ray_batch"] = neus_batch_size
             except Exception as e:
-                print(f"[Fusion] NeuS ray sampling failed (fallback to adapter sampler): {e}")
+                print(
+                    f"[Fusion] NeuS ray sampling failed (fallback to adapter sampler): {e}"
+                )
                 self._stats["last_neus_ray_batch"] = 0
 
         if gaussian_batch_size:

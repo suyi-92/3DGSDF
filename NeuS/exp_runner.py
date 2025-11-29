@@ -113,10 +113,12 @@ class Runner:
         image_perm = self.get_image_perm()
 
         for iter_i in tqdm(range(res_step)):
+            # 1) 随机抽取一张图上的一批射线（包含射线起点/方向、真值颜色、掩码）
             data = self.dataset.gen_random_rays_at(
                 image_perm[self.iter_step % len(image_perm)], self.batch_size
             )
 
+            # 2) 拆分射线属性，并根据球半径求每条射线的 near/far
             rays_o, rays_d, true_rgb, mask = (
                 data[:, :3],
                 data[:, 3:6],
@@ -125,6 +127,7 @@ class Runner:
             )
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
+            # 3) 背景与掩码预处理（可选白背景，掩码二值化或全 1）
             background_rgb = None
             if self.use_white_bkgd:
                 background_rgb = torch.ones([1, 3])
@@ -134,6 +137,7 @@ class Runner:
             else:
                 mask = torch.ones_like(mask)
 
+            # 4) 前向渲染一批射线，得到 NeuS 输出（颜色、SDF、CDF、梯度误差等）
             mask_sum = mask.sum() + 1e-5
             render_out = self.renderer.render(
                 rays_o,
@@ -143,6 +147,30 @@ class Runner:
                 background_rgb=background_rgb,
                 cos_anneal_ratio=self.get_cos_anneal_ratio(),
             )
+
+            # 返回字段详细说明：
+            #   color_fine     : [B, 3]
+            #       - 最终渲染颜色；若启用背景分支，已按权重与背景颜色混合。
+            #   s_val          : [B, 1]
+            #       - = 1 / inv_s，deviation 网络的全局锐度尺度；值大→表面更尖锐，值小→更平滑。
+            #   cdf_fine       : [B, n_samples]
+            #       - 前景采样点的累积分布函数（CDF），用于重要性采样或可视化诊断。
+            #   weight_sum     : [B, 1]
+            #       - 所有体积权重之和；启用背景时包含前景 + 背景。
+            #   weight_max     : [B, 1]
+            #       - 射线上最大的单点权重，监控“是否过尖锐/过度集中”。
+            #   gradients      : [B, n_samples, 3]
+            #       - SDF 梯度（法线方向），与前景采样点一一对应。
+            #   weights        : [B, n_samples] 或 [B, n_samples + n_outside]
+            #       - 体积渲染权重；启用背景时尾部为背景段。只要前景可取 weights[:, :n_samples]。
+            #   mid_z_vals     : [B, n_samples]
+            #       - 每个采样段的中点深度，长度与前景采样一致；末段用 sample_dist 近似补齐，便于与 weights 对齐做期望。
+            #   gradient_error : 标量
+            #       - Eikonal 正则项，鼓励 |∇SDF| ≈ 1。
+            #   inside_sphere  : [B, n_samples]
+            #       - 标记中点是否在单位球内；用于背景混合和正则遮罩。
+            #   z_vals         : [B, n_samples]
+            #       - 本次使用的前景采样深度（若启用背景，背景 z 仅用于背景分支，不在此返回）。
 
             color_fine = render_out["color_fine"]
             s_val = render_out["s_val"]

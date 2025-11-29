@@ -148,6 +148,17 @@ class Dataset:
     def gen_random_rays_at(self, img_idx, batch_size):
         """
         Generate random rays at world space from one camera.
+
+        从指定相机随机采样 batch_size 条射线（含颜色与掩码），返回拼接张量。
+
+        参数：
+            img_idx: 采样的相机/图像索引
+            batch_size: 需要的射线数量
+
+        返回：
+            shape [B, 10] 的张量，依次为
+            [ray_o(3), ray_d(3), color_rgb(3), mask(1)]
+            均已转换到统一 device（与 intrinsics_all_inv 同设备）。
         """
         # TODO: 改写了该函数，使得所有计算都在同一个 device 上完成（torch=2.0.1）
 

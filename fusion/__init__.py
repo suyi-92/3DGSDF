@@ -28,6 +28,14 @@ from .gaussian_adapter import GaussianSplattingAdapter
 from .neus_adapter import NeuSAdapter
 from .fusion_wrapper import FusionWrapper
 from .samplers import RaySampler, UniformSampler, GSGuidedSampler
+from .prewarm import (
+    PrewarmResult3DGS,
+    PrewarmResultNeuS,
+    prewarm_gaussian,
+    prewarm_neus,
+    load_prewarm_gaussian,
+    load_prewarm_neus,
+)
 
 __all__ = [
     # 数据类 / Data classes
@@ -45,6 +53,12 @@ __all__ = [
     "RaySampler",
     "UniformSampler",
     "GSGuidedSampler",
+    "PrewarmResult3DGS",
+    "PrewarmResultNeuS",
+    "prewarm_gaussian",
+    "prewarm_neus",
+    "load_prewarm_gaussian",
+    "load_prewarm_neus",
     # 工具类 / Utility classes
     "MutableHandle",
     "APIRegistry",

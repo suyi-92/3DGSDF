@@ -456,6 +456,29 @@ class GaussianSplattingAdapter(AdapterBase):
         self.bus.publish("gaussian.export_surface", ply_path)
         return ply_path
 
+    def load_checkpoint(self, ply_path: Path, iteration: Optional[int] = None):
+        """
+        Load Gaussians from a saved point cloud checkpoint.
+
+        Args:
+            ply_path: Path to point_cloud.ply produced by Scene.save / export_surface.
+            iteration: Optional iteration number to sync internal counters.
+        """
+
+        if torch is None or self.gaussians is None:
+            raise RuntimeError("GaussianSplattingAdapter not bootstrapped.")
+
+        ply_path = Path(ply_path)
+        if not ply_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ply_path}")
+
+        self.gaussians.load_ply(
+            ply_path,
+            use_trained_exp=self._dataset.train_test_exp if self._dataset else False,
+        )
+        if iteration is not None:
+            self._iteration = int(iteration)
+
     def import_surface(self, mesh_path: Path, sh_degree: int = 3):
         """
         Initialize Gaussians from an external mesh/point cloud.

@@ -101,6 +101,27 @@ class NeuSAdapter(AdapterBase):
             "提供额外的监督（例如 Gaussian 渲染）。",
         )
 
+    def load_checkpoint(self, ckpt_path: Path):
+        """
+        Load NeuS checkpoint from a .pth file recorded during prewarm.
+
+        Args:
+            ckpt_path: Full path to ckpt_xxxxxx.pth.
+        """
+
+        if torch is None or self.runner is None:
+            raise RuntimeError("NeuSAdapter not bootstrapped.")
+
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"NeuS checkpoint not found: {ckpt_path}")
+
+        # Ensure runner.base_exp_dir points to checkpoint parent
+        checkpoints_dir = ckpt_path.parent
+        base_exp_dir = checkpoints_dir.parent
+        self.runner.base_exp_dir = str(base_exp_dir)
+        self.runner.load_checkpoint(ckpt_path.name)
+
     def mutable(self, attr: str) -> MutableHandle:
         """
         Return a handle to mutate an internal NeuS attribute.
